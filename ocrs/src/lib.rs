@@ -30,7 +30,8 @@ pub use preprocess::{DimOrder, ImagePixels, ImageSource, ImageSourceError};
 pub use recognition::DecodeMethod;
 pub use text_items::{TextChar, TextItem, TextLine, TextWord};
 
-// nb. The "E" before "ABCDE" should be the EUR symbol.
+// Default alphabet for v1 models. New models embed their alphabet
+// in ONNX metadata, which is read automatically at load time.
 const DEFAULT_ALPHABET: &str = " 0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~EABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /// Configuration for an [OcrEngine] instance.
@@ -130,7 +131,49 @@ pub struct OcrInput {
 impl OcrEngine {
     /// Construct a new engine from a given configuration.
     pub fn new(params: OcrEngineParams) -> anyhow::Result<OcrEngine> {
-        Self::new_impl(params.into())
+        let detector = params
+            .detection_model
+            .map(|model| TextDetector::from_model(model, Default::default()))
+            .transpose()?;
+
+        // Use from_rten_model to read alphabet from model metadata.
+        let recognizer = params
+            .recognition_model
+            .map(TextRecognizer::from_rten_model)
+            .transpose()?;
+
+        // Try to read alphabet from model metadata, fall back to default.
+        let alphabet = params.alphabet.unwrap_or_else(|| {
+            if let Some(ref rec) = recognizer {
+                if let Some(model_alphabet) = rec.model_alphabet() {
+                    return model_alphabet;
+                }
+            }
+            DEFAULT_ALPHABET.to_string()
+        });
+
+        let excluded_char_labels = params.allowed_chars.map(|allowed_characters| {
+            alphabet
+                .chars()
+                .enumerate()
+                .filter_map(|(index, char)| {
+                    if !allowed_characters.contains(char) {
+                        Some(index + 1)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
+        Ok(OcrEngine {
+            detector,
+            recognizer,
+            debug: params.debug,
+            decode_method: params.decode_method,
+            alphabet,
+            excluded_char_labels,
+        })
     }
 
     /// Internal constructor which allows using a dummy inference engine in tests.
@@ -146,9 +189,15 @@ impl OcrEngine {
             .map(TextRecognizer::from_model)
             .transpose()?;
 
-        let alphabet = params
-            .alphabet
-            .unwrap_or_else(|| DEFAULT_ALPHABET.to_string());
+        // Try to read alphabet from model metadata, fall back to default.
+        let alphabet = params.alphabet.unwrap_or_else(|| {
+            if let Some(ref rec) = recognizer {
+                if let Some(model_alphabet) = rec.model_alphabet() {
+                    return model_alphabet;
+                }
+            }
+            DEFAULT_ALPHABET.to_string()
+        });
 
         let excluded_char_labels = params.allowed_chars.map(|allowed_characters| {
             alphabet

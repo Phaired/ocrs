@@ -315,6 +315,8 @@ fn text_lines_from_recognition_results(
 pub struct TextRecognizer {
     model: Box<dyn Model + Send + Sync>,
     input_shape: Vec<Dimension>,
+    /// Alphabet embedded in the model's metadata, if available.
+    alphabet: Option<String>,
 }
 
 impl TextRecognizer {
@@ -325,7 +327,24 @@ impl TextRecognizer {
         Ok(TextRecognizer {
             model: Box::new(model),
             input_shape,
+            alphabet: None,
         })
+    }
+
+    /// Initialize from an rten::Model, reading alphabet from metadata.
+    pub fn from_rten_model(model: rten::Model) -> anyhow::Result<TextRecognizer> {
+        let input_shape = <rten::Model as Model>::input_shape(&model)?;
+        let alphabet = model.metadata().get("alphabet").map(|s| s.to_string());
+        Ok(TextRecognizer {
+            model: Box::new(model),
+            input_shape,
+            alphabet,
+        })
+    }
+
+    /// Return the alphabet embedded in the model's metadata, if available.
+    pub fn model_alphabet(&self) -> Option<String> {
+        self.alphabet.clone()
     }
 
     /// Return the expected height of input line images.
@@ -339,6 +358,7 @@ impl TextRecognizer {
     /// Run text recognition on an NCHW batch of text line images, and return
     /// a `[batch, seq, label]` tensor of class probabilities.
     fn run(&self, input: NdTensor<f32, 4>) -> Result<NdTensor<f32, 3>, ModelRunError> {
+        let batch_size = input.size(0);
         let input: Tensor<f32> = input.into();
         let output = self
             .model
@@ -353,8 +373,13 @@ impl TextRecognizer {
             ))
         })?;
 
-        // Transpose from [seq, batch, class] => [batch, seq, class]
-        rec_sequence.permute([1, 0, 2]);
+        // Detect output format and normalize to [batch, seq, class].
+        // v1 (CRNN/GRU) outputs [seq, batch, class].
+        // v2 (CNN+Transformer) outputs [batch, seq, class] directly.
+        if rec_sequence.size(0) != batch_size {
+            // v1 format: [seq, batch, class] => [batch, seq, class]
+            rec_sequence.permute([1, 0, 2]);
+        }
 
         Ok(rec_sequence)
     }

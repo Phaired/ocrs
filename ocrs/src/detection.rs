@@ -61,6 +61,16 @@ fn find_connected_component_rects(
         .collect()
 }
 
+/// Output of the text detection model containing probability maps.
+pub struct TextDetectionOutput {
+    /// Probability map indicating whether each pixel is part of a text word.
+    pub text_mask: NdTensor<f32, 2>,
+
+    /// Optional probability map indicating column/paragraph separators.
+    /// Present when using DetectionModelV2 (2-channel output).
+    pub separator_mask: Option<NdTensor<f32, 2>>,
+}
+
 /// Text detector which finds the oriented bounding boxes of words in an input
 /// image.
 pub struct TextDetector {
@@ -133,14 +143,36 @@ impl TextDetector {
         image: NdTensorView<f32, 3>,
         debug: bool,
     ) -> anyhow::Result<NdTensor<f32, 2>> {
+        let output = self.detect_text_pixels_multi(image, debug)?;
+        Ok(output.text_mask)
+    }
+
+    /// Detect text pixels with multi-channel output support.
+    ///
+    /// Returns a [TextDetectionOutput] containing the text mask and an
+    /// optional separator mask (when using a 2-channel detection model).
+    pub fn detect_text_pixels_multi(
+        &self,
+        image: NdTensorView<f32, 3>,
+        debug: bool,
+    ) -> anyhow::Result<TextDetectionOutput> {
         let [img_chans, img_height, img_width] = image.shape();
 
         // Add batch dim
         let image = image.reshaped([1, img_chans, img_height, img_width]);
 
-        let [_, _, Dimension::Fixed(in_height), Dimension::Fixed(in_width)] = self.input_shape[..]
-        else {
-            return Err(anyhow!("failed to get model dims"));
+        // Support both fixed and dynamic input shapes.
+        let (in_height, in_width) = match self.input_shape[..] {
+            [_, _, Dimension::Fixed(h), Dimension::Fixed(w)] => (h, w),
+            [_, _, Dimension::Symbolic(_), Dimension::Symbolic(_)] => {
+                // Dynamic input: round to nearest multiple of 64 for
+                // compatibility with 6 levels of downsampling (2^6 = 64).
+                let round_to = 64;
+                let h = ((img_height + round_to - 1) / round_to) * round_to;
+                let w = ((img_width + round_to - 1) / round_to) * round_to;
+                (h, w)
+            }
+            _ => return Err(anyhow!("failed to get model dims")),
         };
 
         // Pad small images to the input size of the text detection model. This is
@@ -181,23 +213,39 @@ impl TextDetector {
             opts
         };
 
-        let text_mask: Tensor<f32> = self.model.run(image.view(), Some(opts))?;
+        let output_mask: Tensor<f32> = self.model.run(image.view(), Some(opts))?;
+        let n_channels = output_mask.size(1);
 
-        // Resize probability mask to original input size and apply threshold to get a
-        // binary text/not-text mask.
-        let text_mask = text_mask
-            .slice((
-                ..,
-                ..,
-                ..(in_height - pad_bottom as usize),
-                ..(in_width - pad_right as usize),
-            ))
-            .resize_image([img_height, img_width])?;
+        // Crop padding and resize back to original image size.
+        let cropped = output_mask.slice((
+            ..,
+            ..,
+            ..(in_height - pad_bottom as usize),
+            ..(in_width - pad_right as usize),
+        ));
 
-        // Remove batch, channel dims.
-        let text_mask = text_mask.into_shape([img_height, img_width]);
+        // Extract text mask (channel 0).
+        let text_mask = cropped
+            .slice((.., 0..1, .., ..))
+            .resize_image([img_height, img_width])?
+            .into_shape([img_height, img_width]);
 
-        Ok(text_mask)
+        // Extract separator mask (channel 1) if present.
+        let separator_mask = if n_channels >= 2 {
+            Some(
+                cropped
+                    .slice((.., 1..2, .., ..))
+                    .resize_image([img_height, img_width])?
+                    .into_shape([img_height, img_width]),
+            )
+        } else {
+            None
+        };
+
+        Ok(TextDetectionOutput {
+            text_mask,
+            separator_mask,
+        })
     }
 }
 
